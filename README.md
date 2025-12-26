@@ -27,3 +27,23 @@ A common example is log buffering in BLE-based systems. After a device reset, it
 
 Using memlease, log buffers can be dynamically allocated with a timeout. If the logs are not retrieved within the specified time, the memory is automatically freed, preventing long-term memory waste while still allowing logs to be captured when needed.
 
+## Config
+
+CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF
+
+Specifies the number of allocation tracking entries stored in a single memlease entry block.
+
+The first entry block is statically allocated at build time. Each entry in the block tracks one active allocation. When this initial block becomes full, additional entry blocks are dynamically allocated on the heap as needed.
+
+As allocations are released, entry blocks are reclaimed automatically. When all entries in a dynamically allocated block are free and it is the most recently allocated block, that block is freed.
+
+### Trade-offs
+Larger values:
+- Fewer dynamic allocations of entry blocks
+- Increased static memory usage (the initial block can never be freed)
+
+Smaller values:
+- Reduced static memory footprint
+- More frequent allocation and deallocation of entry blocks at runtime
+
+The default value of 32 provides a balanced trade-off for most systems. With this setting, up to 32 active heap allocations can be tracked before an additional entry block of 32 entries is allocated.
