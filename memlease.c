@@ -44,13 +44,37 @@ typedef struct {
 } memlease_entry_block_t;
 
 typedef struct {
-    memlease_entry_block_t* entries;
+    memlease_entry_block_t entries;
     uint32_t num_entries_allocated;
     uint16_t allocate_count;        // Counter to assign to allocated entries
 } memlease_data_t;
 
-static memlease_data_t memlease_data;
+static memlease_data_t memlease_data = {
+    .num_entries_allocated = CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF,
+};
 static K_MUTEX_DEFINE(memlease_lock);
+
+static uint32_t memlease_init_entry(memlease_entry_t *entry, uint32_t size, int64_t timeout) {
+    uint32_t handle = 0;
+
+    entry->buf = k_malloc(size);
+    if (!entry->buf) {
+        return 0;
+    }
+    entry->size = size;
+    entry->status = STATUS_ALLOCATED | STATUS_ERROR_ON_TIMEOUT;
+    if (timeout > 0) {
+        entry->expiry_time = k_uptime_get() + timeout;
+    } else {
+        entry->expiry_time = 0; // Infinite
+    }
+    entry->release_count = 0;   // Default release count
+    entry->allocate_num = memlease_data.allocate_count++;
+    memlease_data.allocate_count &= 0xFFFF; // Wrap around
+    handle = i + 1; // Handles are 1-based
+    handle |= (entry->allocate_num << 16);
+    return handle;
+}
 
 // size - Size of the buffer in bytes
 // timeout - Time in milliseconds the buffer is leased for, 0 means infinite
@@ -58,53 +82,52 @@ static K_MUTEX_DEFINE(memlease_lock);
 uint32_t memlease_alloc(uint32_t size, int64_t timeout)
 {
     uint32_t handle = 0;
+    if (k_is_in_isr()) {
+        LOG_ERR("memlease_alloc called from ISR");
+        return 0;
+    }
     k_mutex_lock(&memlease_lock, K_FOREVER);
     do {
         // Find a free entry
-        // uint32_t i;
-        // for (i = 0; i < memlease_data.num_entries_allocated; i++) {
-        //     memlease_entry_t *entry = &memlease_data.entries->entries[i];
-        //     if (!(entry->status & STATUS_ALLOCATED)) {
-        //         // Found a free entry
-        //         entry->buf = k_malloc(size);
-        //         if (!entry->buf) {
-        //             // Memory allocation failed
-        //             break;
-        //         }
-        //         entry->size = size;
-        //         entry->status = STATUS_ALLOCATED;
-        //         if (timeout > 0) {
-        //             int64_t current_time = k_uptime_get();
-        //             entry->expiry_time = current_time + timeout;
-        //         } else {
-        //             entry->expiry_time = 0; // Infinite
-        //         }
-        //         entry->release_count = 1; // Default release count
-        //         handle = i + 1; // Handles are 1-based
-        //         break;
-        //     }
-        // }
-        // if (handle != 0) {
-        //     // Successfully allocated
-        //     break;
-        // }
-        // // No free entry found, need to allocate a new block
-        // memlease_entry_block_t *new_block = k_calloc(sizeof(memlease_entry_block_t));
-        // if (!new_block) {
-        //     // Memory allocation failed
-        //     break;
-        // }
-        // // Initialize new block
-        // for (i = 0; i < MEMLEASE_ENTRIES_PER_BLOCK; i++) {
-        //     new_block->entries[i].buf = NULL;
-        //     new_block->entries[i].size = 0;
-        //     new_block->entries[i].expiry_time = 0;
-        //     new_block->entries[i].status = 0;
-        //     new_block->entries[i].release_count = 0;
-        // }
-        // new_block->next = memlease_data.entries;
-        // memlease_data.entries = new_block;
-        // memlease_data.num_entries_allocated += MEMLEASE_ENTRIES_PER_BLOCK;
+        uint32_t i;
+        uint32_t entry_num = 0;
+        memlease_entry_block_t *block = &memlease_data.entries;
+
+        for (i = 0; i < memlease_data.num_entries_allocated; i++) {
+            memlease_entry_t *entry = &block->entries[i];
+            if (!(entry->status & STATUS_ALLOCATED)) {
+                // Found a free entry
+                handle = memlease_init_entry(entry, size, timeout);
+                if (handle == 0) {
+                    // Memory allocation failed
+                    LOG_ERR("Failed to allocate buffer of size %d", size);
+                    return 0;
+                }
+            }
+            entry_num++;
+            if (entry_num >= MEMLEASE_ENTRIES_PER_BLOCK) {
+                if (!block->next) {
+                    LOG_ERR("Next block is NULL while number of allocated entries says there should be more");
+                    break;
+                }
+                block = (memlease_entry_block_t *)block->next;
+                entry_num = 0;
+            }
+        }
+        if (handle != 0) {
+            // Successfully allocated
+            break;
+        }
+        // No free entry found, need to allocate a new block
+        memlease_entry_block_t *new_block = k_calloc(sizeof(memlease_entry_block_t));
+        if (!new_block) {
+            // Memory allocation failed
+            LOG_ERR("Failed to allocate new memlease entry block");
+            break;
+        }
+        block->next = new_block;
+        memlease_data.num_entries_allocated += CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF;
+        handle = memlease_init_entry(&new_block->entries[0], size, timeout);
     } while (0);
     k_mutex_unlock(&memlease_lock);
     return handle;
