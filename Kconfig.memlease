@@ -1,0 +1,15 @@
+menuconfig MEMLEASE
+    bool "MemLease"
+	default y
+
+if MEMLEASE
+
+config MEMLEASE_NUM_ENTRIES_PER_BUF
+    int "Number of entries per buffer"
+    default 32
+
+endif # MEMLEASE
+
+module = MEMLEASE
+module-str = MemLease
+source "subsys/logging/Kconfig.template.log_config"

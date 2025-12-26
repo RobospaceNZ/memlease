@@ -25,8 +25,6 @@
 
 #include <zephyr/kernel.h>
 
-#define MEMLEASE_ENTRIES_PER_BLOCK          32
-
 #define STATUS_ALLOCATED                    (1<<0)  // This entry is allocated
 #define STATUS_LOCKED                       (1<<1)  // Don't free, even after timeout. A thread can lock it when it is busy with the buffer.
 #define STATUS_ERROR_ON_TIMEOUT             (1<<2)  // When timeout occurs, send and error log message.
@@ -41,7 +39,7 @@ typedef struct {
 } memlease_entry_t;
 
 typedef struct {
-    memlease_entry_t entries[MEMLEASE_ENTRIES_PER_BLOCK];
+    memlease_entry_t entries[CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF];
     void *next;
 } memlease_entry_block_t;
 
