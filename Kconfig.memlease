@@ -1,5 +1,5 @@
 menuconfig MEMLEASE
-    bool "MemLease"
+    bool "Memlease"
 	default y
 
 if MEMLEASE
@@ -8,8 +8,16 @@ config MEMLEASE_NUM_ENTRIES_PER_BUF
     int "Number of entries per buffer"
     default 32
 
+config MEMLEASE_THREAD_STACK_SIZE
+	int "Memlease thread stack size"
+	default 1024
+
+config MEMLEASE_THREAD_PRIORITY
+	int "Memlease thread priority"
+	default 7
+
 endif # MEMLEASE
 
 module = MEMLEASE
-module-str = MemLease
+module-str = Memlease
 source "subsys/logging/Kconfig.template.log_config"

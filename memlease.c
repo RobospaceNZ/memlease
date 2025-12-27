@@ -24,6 +24,8 @@
  */
 
 #include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(memlease);
 
 #define MEMLEASE_STATUS_ALLOCATED               (1<<0)  // This entry is allocated
 #define MEMLEASE_STATUS_LOCKED                  (1<<1)  // Don't free, even after timeout. A thread can lock it when it is busy with the buffer.
@@ -33,6 +35,7 @@
 #define MEMLEASE_ERROR_ALLOCATION_NUM_MISMATCH  -2
 #define MEMLEASE_ERROR_CORRUPT_BLOCK_POINTER    -3
 #define MEMLEASE_ERROR_NOT_ALLOCATED            -4
+#define MEMLEASE_ERROR_CANNOT_CALL_FROM_ISR     -5
 
 typedef struct {
     void *buf;
@@ -50,15 +53,18 @@ typedef struct {
 } memlease_entry_block_t;
 
 typedef struct {
+    int64_t next_timeout;
     memlease_entry_block_t entries;
     uint32_t num_entries_allocated;
     uint16_t allocate_count;        // Counter to assign to allocated entries
+    bool recalculate_timeout;
 } memlease_data_t;
 
 static memlease_data_t memlease_data = {
     .num_entries_allocated = CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF,
 };
 static K_MUTEX_DEFINE(memlease_lock);
+K_SEM_DEFINE(timeout_changed_sem, 0, 1);
 
 static uint32_t memlease_init_entry(memlease_entry_t *entry, uint32_t size, int64_t timeout) {
     uint32_t handle = 0;
@@ -71,6 +77,11 @@ static uint32_t memlease_init_entry(memlease_entry_t *entry, uint32_t size, int6
     entry->status = STATUS_ALLOCATED | STATUS_ERROR_ON_TIMEOUT;
     if (timeout > 0) {
         entry->expiry_time = k_uptime_get() + timeout;
+        if (!memlease_data.next_timeout || (entry->expiry_time < memlease_data.next_timeout)) {
+            // New timeout is earlier than any other timeout
+            memlease_data.next_timeout = entry->expiry_time;
+            k_sem_give(&timeout_changed_sem);
+        }
     } else {
         entry->expiry_time = 0; // Infinite
     }
@@ -197,3 +208,153 @@ static int32_t memlease_check_handle(uint32_t handle, memlease_entry_t **out_ent
     *out_block = block;
     return 0;
 }
+
+// Return a pointer to the buffer, NULL if the handle is invalid
+// handle - Handle returned by memlease_alloc
+// out_size - If not NULL, the size of the buffer is written to this pointer
+// lock - If true, the buffer is marked as locked and will not be freed on timeout.
+//        If calling code is going to use this buffer and wants to prevent it from being freed while in use, 
+//        it should set this to true. Caller must make sure to free the buffer when finished. 
+void *memlease_get_buf(uint32_t handle, uint32_t *out_size, bool lock) {
+    memlease_entry_t *entry = NULL;
+    memlease_entry_block_t *block = NULL;
+    int32_t ret;
+
+    if (k_is_in_isr()) {
+        LOG_ERR("memlease_get_buf called from ISR");
+        return NULL;
+    }
+    k_mutex_lock(&memlease_lock, K_FOREVER);
+    ret = memlease_check_handle(handle, &entry, &block);
+    if (ret != 0) {
+        k_mutex_unlock(&memlease_lock);
+        return NULL;
+    }
+    if (lock) {
+        entry->status |= MEMLEASE_STATUS_LOCKED;
+    } else {
+        entry->status &= ~MEMLEASE_STATUS_LOCKED;
+    }
+    if (out_size) {
+        *out_size = entry->size;
+    }
+    k_mutex_unlock(&memlease_lock);
+    return entry->buf;
+}
+
+// Free the leased memory buffer
+// handle - Handle returned by memlease_alloc
+uint32_t memlease_free(uint32_t handle) {
+    memlease_entry_t *entry = NULL;
+    memlease_entry_block_t *block = NULL;
+    int32_t ret;
+
+    if (k_is_in_isr()) {
+        LOG_ERR("memlease_free called from ISR");
+        return MEMLEASE_ERROR_CANNOT_CALL_FROM_ISR;
+    }
+    k_mutex_lock(&memlease_lock, K_FOREVER);
+    ret = memlease_check_handle(handle, &entry, &block);
+    if (ret != 0) {
+        k_mutex_unlock(&memlease_lock);
+        return ret;
+    }
+    if (entry->release_count > 0) {
+        entry->release_count--;
+        k_mutex_unlock(&memlease_lock);
+        return 0;
+    }
+    // Free the entry
+    k_free(entry->buf);
+    memset(entry, 0, sizeof(memlease_entry_t));
+    block->allocated_count--;
+    memlease_data.recalculate_timeout = true;
+    k_sem_give(&timeout_changed_sem);
+    k_mutex_unlock(&memlease_lock);
+    return 0;
+}
+
+static void memlease_thread_fn(void) {
+    k_timeout_t sleep_time = K_FOREVER;
+    int64_t now;
+
+    while(true) {
+        //k_sem_give(&timeout_changed_sem);
+        k_sem_take(&timeout_changed_sem, sleep_time);
+        now = k_uptime_get();
+        k_mutex_lock(&memlease_lock, K_FOREVER);
+        if (k_uptime_get() > memlease_data.next_timeout) {
+            // At least one of the entries has timed out
+            // memlease_data.next_timeout = 0;
+            // for (uint32_t i = 0; i < memlease_data.num_entries_allocated; i++) {
+            //     memlease_entry_block_t *block = &memlease_data.entries;
+            //     uint32_t index = i;
+            //     while (index >= CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF) {
+            //         if (!block->next) {
+            //             break;
+            //         }
+            //         block = (memlease_entry_block_t *)block->next;
+            //         index -= CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF;
+            //     }
+            //     memlease_entry_t *entry = &block->entries[index];
+            //     if ((entry->status & STATUS_ALLOCATED) && (entry->expiry_time > 0) && (now >= entry->expiry_time)) {
+            //         // This entry has timed out
+            //         if (!(entry->status & STATUS_LOCKED)) {
+            //             // Free the entry
+            //             if (entry->status & STATUS_ERROR_ON_TIMEOUT) {
+            //                 LOG_ERR("Memlease entry timed out (handle: 0x%08X)", (i + 1) | (entry->allocate_num << 16));
+            //             }
+            //             k_free(entry->buf);
+            //             entry->buf = NULL;
+            //             entry->size = 0;
+            //             entry->expiry_time = 0;
+            //             entry->status = 0;
+            //             entry->release_count = 0;
+            //             block->allocated_count--;
+            //         } else {
+            //             // Entry is locked, skip freeing
+            //             LOG_WRN("Memlease entry timed out but is locked (handle: 0x%08X)", (i + 1) | (entry->allocate_num << 16));
+            //         }
+            //     } else {
+            //         // Not timed out, check if this is the next timeout
+            //         if ((entry->status & STATUS_ALLOCATED) && (entry->expiry_time > 0)) {
+            //             if (!memlease_data.next_timeout || (entry->expiry_time < memlease_data.next_timeout)) {
+            //                 memlease_data.next_timeout = entry->expiry_time;
+            //             }
+            //         }
+            //     }
+            // }
+        }
+        if (memlease_data.recalculate_timeout) {
+            // Recalculate next timeout
+            // memlease_data.next_timeout = 0;
+            // for (uint32_t i = 0; i < memlease_data.num_entries_allocated; i++) {
+            //     memlease_entry_block_t *block = &memlease_data.entries;
+            //     uint32_t index = i;
+            //     while (index >= CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF) {
+            //         if (!block->next) {
+            //             break;
+            //         }
+            //         block = (memlease_entry_block_t *)block->next;
+            //         index -= CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF;
+            //     }
+            //     memlease_entry_t *entry = &block->entries[index];
+            //     if ((entry->status & STATUS_ALLOCATED) && (entry->expiry_time > 0)) {
+            //         if (!memlease_data.next_timeout || (entry->expiry_time < memlease_data.next_timeout)) {
+            //             memlease_data.next_timeout = entry->expiry_time;
+            //         }
+            //     }
+            // }
+            memlease_data.recalculate_timeout = false;
+        }
+        if (!memlease_data.next_timeout) {
+            // No timeouts scheduled
+            sleep_time = K_FOREVER;
+        } else {
+            sleep_time = K_MSEC(memlease_data.next_timeout - now);
+        }
+        k_mutex_unlock(&memlease_lock);
+    }
+}
+
+K_THREAD_DEFINE(memlease_thread, CONFIG_MEMLEASE_THREAD_STACK_SIZE, memlease_thread_fn, NULL, NULL, NULL, CONFIG_MEMLEASE_THREAD_PRIORITY, 0, 0);
