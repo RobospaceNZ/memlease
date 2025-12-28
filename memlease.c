@@ -91,7 +91,7 @@ static void memlease_check_timeout(memlease_entry_t *entry) {
 }
 
 // Initialize a memlease entry and return its handle
-static uint32_t memlease_init_entry(uint32_t index, memlease_entry_t *entry, uint32_t size, int64_t timeout) {
+static uint32_t memlease_init_entry(uint32_t index, memlease_entry_t *entry, uint32_t size, int64_t timeout, void **buf_out) {
     uint32_t handle = 0;
 
     if (index == 0xFFFE) {
@@ -102,8 +102,11 @@ static uint32_t memlease_init_entry(uint32_t index, memlease_entry_t *entry, uin
     if (!entry->buf) {
         return 0;
     }
+    if (buf_out) {
+        *buf_out = entry->buf;
+    }
     entry->size = size;
-    entry->status = STATUS_ALLOCATED | STATUS_ERROR_ON_TIMEOUT;
+    entry->status = MEMLEASE_STATUS_ALLOCATED | MEMLEASE_STATUS_ERROR_ON_TIMEOUT;
     if (timeout > 0) {
         entry->expiry_time = k_uptime_get() + timeout;
         memlease_check_timeout(entry);
@@ -119,9 +122,10 @@ static uint32_t memlease_init_entry(uint32_t index, memlease_entry_t *entry, uin
 }
 
 // size - Size of the buffer in bytes
+// buf_out - If not NULL, the pointer to the allocated buffer is written to this pointer
 // timeout - Time in milliseconds the buffer is leased for, 0 means infinite
 // Returns a handle to the leased memory buffer, 0 on failure. This number cannot be used a pointer.
-uint32_t memlease_alloc(uint32_t size, int64_t timeout)
+uint32_t memlease_alloc(uint32_t size, void **buf_out, int64_t timeout)
 {
     uint32_t handle = 0;
     bool error = false;
@@ -151,7 +155,7 @@ uint32_t memlease_alloc(uint32_t size, int64_t timeout)
             memlease_entry_t *entry = &block->entries[i];
             if (!(entry->status & STATUS_ALLOCATED)) {
                 // Found a free entry
-                handle = memlease_init_entry(i, entry, size, timeout);
+                handle = memlease_init_entry(i, entry, size, timeout, buf_out);
                 if (handle == 0) {
                     // Memory allocation failed
                     LOG_ERR("Failed to allocate buffer of size %d", size);
@@ -186,7 +190,7 @@ uint32_t memlease_alloc(uint32_t size, int64_t timeout)
         block->next = new_block;
         new_block->prev = block;
         memlease_data.num_entries_allocated += CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF;
-        handle = memlease_init_entry(i, &new_block->entries[0], size, timeout);
+        handle = memlease_init_entry(i, &new_block->entries[0], size, timeout, buf_out);
         if (handle == 0) {
             // Memory allocation failed
             LOG_ERR("Failed to allocate buffer of size %d", size);
@@ -297,7 +301,9 @@ uint32_t memlease_free(uint32_t handle) {
         // Free the entry
         k_free(entry->buf);
         memset(entry, 0, sizeof(memlease_entry_t));
-        block->allocated_count--;
+        if (block->allocated_count) {
+            block->allocated_count--;
+        }
         memlease_data.recalculate_timeout = true;
         k_sem_give(&timeout_changed_sem);
     }
