@@ -125,8 +125,7 @@ static uint32_t memlease_init_entry(uint32_t index, memlease_entry_t *entry, uin
 // buf_out - If not NULL, the pointer to the allocated buffer is written to this pointer
 // timeout - Time in milliseconds the buffer is leased for, 0 means infinite
 // Returns a handle to the leased memory buffer, 0 on failure. This number cannot be used a pointer.
-uint32_t memlease_alloc(uint32_t size, void **buf_out, int64_t timeout)
-{
+uint32_t memlease_alloc(uint32_t size, void **buf_out, int64_t timeout) {
     uint32_t handle = 0;
     bool error = false;
 
@@ -153,7 +152,7 @@ uint32_t memlease_alloc(uint32_t size, void **buf_out, int64_t timeout)
                 continue;
             }
             memlease_entry_t *entry = &block->entries[i];
-            if (!(entry->status & STATUS_ALLOCATED)) {
+            if (!(entry->status & MEMLEASE_STATUS_ALLOCATED)) {
                 // Found a free entry
                 handle = memlease_init_entry(i, entry, size, timeout, buf_out);
                 if (handle == 0) {
@@ -181,7 +180,7 @@ uint32_t memlease_alloc(uint32_t size, void **buf_out, int64_t timeout)
             break;
         }
         // No free entry found, need to allocate a new block
-        memlease_entry_block_t *new_block = k_calloc(sizeof(memlease_entry_block_t));
+        memlease_entry_block_t *new_block = k_calloc(1, sizeof(memlease_entry_block_t));
         if (!new_block) {
             // Memory allocation failed
             LOG_ERR("Failed to allocate new memlease entry block");
@@ -209,7 +208,6 @@ uint32_t memlease_alloc(uint32_t size, void **buf_out, int64_t timeout)
 static int32_t memlease_check_handle(uint32_t handle, memlease_entry_t **out_entry, memlease_entry_block_t **out_block) {
     uint16_t allocate_num = (handle >> 16) & 0xFFFF;
     uint32_t entry_index = (handle & 0xFFFF) - 1; // Convert to 0-based index
-    uint32_t current_index = 0;
     memlease_entry_block_t *block = &memlease_data.entries;
     memlease_entry_t *entry = NULL;
 
@@ -228,7 +226,7 @@ static int32_t memlease_check_handle(uint32_t handle, memlease_entry_t **out_ent
         entry_index -= CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF;
     }
     entry = &block->entries[entry_index];
-    if (!(entry->status & STATUS_ALLOCATED)) {
+    if (!(entry->status & MEMLEASE_STATUS_ALLOCATED)) {
         LOG_ERR("Handle points to unallocated entry");
         return MEMLEASE_ERROR_NOT_ALLOCATED;
     }
@@ -278,7 +276,7 @@ void *memlease_get_buf(uint32_t handle, uint32_t *out_size, bool lock) {
 
 // Free the leased memory buffer
 // handle - Handle returned by memlease_alloc
-uint32_t memlease_free(uint32_t handle) {
+int32_t memlease_free(uint32_t handle) {
     memlease_entry_t *entry = NULL;
     memlease_entry_block_t *block = NULL;
     int32_t ret;
@@ -312,7 +310,7 @@ uint32_t memlease_free(uint32_t handle) {
 }
 
 // Set or clear the lock status of the leased memory buffer
-uint32_t memlease_set_lock(uint32_t handle, bool lock) {
+int32_t memlease_set_lock(uint32_t handle, bool lock) {
     memlease_entry_t *entry = NULL;
     memlease_entry_block_t *block = NULL;
     int32_t ret;
@@ -338,7 +336,7 @@ uint32_t memlease_set_lock(uint32_t handle, bool lock) {
 }
 
 // Set the timeout for the leased memory buffer
-uint32_t memlease_set_timeout(uint32_t handle, int64_t timeout) {
+int32_t memlease_set_timeout(uint32_t handle, int64_t timeout) {
     memlease_entry_t *entry = NULL;
     memlease_entry_block_t *block = NULL;
     int32_t ret;
@@ -365,7 +363,7 @@ uint32_t memlease_set_timeout(uint32_t handle, int64_t timeout) {
 
 // Set or clear the error on timeout flag for the leased memory buffer.
 // If set, an error message is logged when the buffer times out.
-uint32_t memlease_set_error_on_timeout(uint32_t handle, bool error_on_timeout) {
+int32_t memlease_set_error_on_timeout(uint32_t handle, bool error_on_timeout) {
     memlease_entry_t *entry = NULL;
     memlease_entry_block_t *block = NULL;
     int32_t ret;
@@ -392,7 +390,7 @@ uint32_t memlease_set_error_on_timeout(uint32_t handle, bool error_on_timeout) {
 // Set the release count for the leased memory buffer.
 // Need to be one less than the number of times the buffer needs to be released before it is freed.
 // For example, if the buffer needs to be released 3 times before it is freed, set release_count to 2.
-uint32_t memlease_set_release_count(uint32_t handle, uint8_t release_count) {
+int32_t memlease_set_release_count(uint32_t handle, uint8_t release_count) {
     memlease_entry_t *entry = NULL;
     memlease_entry_block_t *block = NULL;
     int32_t ret;
@@ -430,11 +428,11 @@ static void memlease_thread_fn(void) {
             bool not_last_entry = true;
             while (not_last_entry) {
                 memlease_entry_t *entry = &block->entries[i];
-                if ((entry->status & STATUS_ALLOCATED) && (entry->expiry_time > 0)){
+                if ((entry->status & MEMLEASE_STATUS_ALLOCATED) && (entry->expiry_time > 0)){
                     // This entry has timed out
-                    if ((!(entry->status & STATUS_LOCKED)) && (now >= entry->expiry_time)) {
+                    if ((!(entry->status & MEMLEASE_STATUS_LOCKED)) && (now >= entry->expiry_time)) {
                         // Free the entry
-                        if (entry->status & STATUS_ERROR_ON_TIMEOUT) {
+                        if (entry->status & MEMLEASE_STATUS_ERROR_ON_TIMEOUT) {
                             LOG_ERR("Memlease entry timed out (handle: 0x%08X)", (i + 1) | (entry->allocate_num << 16));
                         }
                         k_free(entry->buf);

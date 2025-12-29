@@ -1,0 +1,6 @@
+tests:
+  memlease.test:
+    platform_allow: nrf52840dk/nrf52840
+    tags: memlease
+    harness: ztest
+    timeout: 300

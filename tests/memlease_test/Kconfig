@@ -1,0 +1,13 @@
+menu "Memlease Test"
+
+rsource "../../Kconfig.memlease"
+
+endmenu
+
+module = MEMLEASE_TEST
+module-str = Memlease Test
+source "${ZEPHYR_BASE}/subsys/logging/Kconfig.template.log_config"
+
+menu "Zephyr Kernel"
+source "Kconfig.zephyr"
+endmenu

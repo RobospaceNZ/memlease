@@ -26,6 +26,12 @@
  #ifndef MEMLEASE_H
 #define MEMLEASE_H
 
-
+int32_t memlease_alloc(uint32_t size, void **buf_out, int64_t timeout);
+void *memlease_get_buf(uint32_t handle, uint32_t *out_size, bool lock);
+int32_t memlease_free(uint32_t handle);
+int32_t memlease_set_lock(uint32_t handle, bool lock);
+int32_t memlease_set_timeout(uint32_t handle, int64_t timeout);
+int32_t memlease_set_error_on_timeout(uint32_t handle, bool error_on_timeout);
+int32_t memlease_set_release_count(uint32_t handle, uint8_t release_count);
 
 #endif // MEMLEASE_H
