@@ -4,7 +4,7 @@
  * Copyright (c) 2025 Hubert Jetschko
  *
  * This file is licensed under the MIT License.
- * 
+ *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
  * in the Software without restriction, including without limitation the rights
@@ -23,51 +23,58 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(memlease);
+#include "memlease.h"
+
+LOG_MODULE_REGISTER(memlease, CONFIG_MEMLEASE_LOG_LEVEL);
 
 #define MEMLEASE_STATUS_ALLOCATED               (1<<0)  // This entry is allocated
 #define MEMLEASE_STATUS_LOCKED                  (1<<1)  // Don't free, even after timeout. A thread can lock it when it is busy with the buffer.
 #define MEMLEASE_STATUS_ERROR_ON_TIMEOUT        (1<<2)  // When timeout occurs, send and error log message.
 
-#define MEMLEASE_ERROR_ENTRY_OUT_OF_BOUNDS      -1
-#define MEMLEASE_ERROR_ALLOCATION_NUM_MISMATCH  -2
-#define MEMLEASE_ERROR_CORRUPT_BLOCK_POINTER    -3
-#define MEMLEASE_ERROR_NOT_ALLOCATED            -4
-#define MEMLEASE_ERROR_CANNOT_CALL_FROM_ISR     -5
+// The lower 16 bits of a handle hold the entry index + 1, so the highest usable index is 0xFFFE
+#define MEMLEASE_MAX_ENTRY_INDEX                0xFFFE
 
 typedef struct {
     void *buf;
     uint32_t size;
-    int64_t expiry_time;        // in milliseconds, 0 means infinite
-    uint16_t allocate_num;      // Unique number assigend for this allocation
+    int64_t expiry_time;        // Uptime in milliseconds, 0 means infinite
+    uint16_t allocate_num;      // Unique number assigned for this allocation
     uint8_t status;
     uint8_t release_count;      // Number of times - 1 this buffer need to be released before it is freed
 } memlease_entry_t;
 
-typedef struct {
+typedef struct memlease_entry_block {
     memlease_entry_t entries[CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF];
-    void *next;
-    void *prev;
+    struct memlease_entry_block *next;
+    struct memlease_entry_block *prev;
     uint32_t allocated_count;
 } memlease_entry_block_t;
 
 typedef struct {
-    int64_t next_timeout;
-    memlease_entry_block_t entries;
-    uint32_t num_entries_allocated;
+    int64_t next_timeout;           // Earliest expiry time of all unlocked entries, 0 means none
+    memlease_entry_block_t entries; // First block, statically allocated
+    memlease_entry_block_t *last_block;
+    uint32_t num_entries_allocated; // Number of entries in all blocks (allocated or not)
+    uint32_t num_allocated;         // Number of entries currently in use
     uint16_t allocate_count;        // Counter to assign to allocated entries
     bool recalculate_timeout;
 } memlease_data_t;
 
 static memlease_data_t memlease_data = {
+    .last_block = &memlease_data.entries,
     .num_entries_allocated = CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF,
 };
 static K_MUTEX_DEFINE(memlease_lock);
-K_SEM_DEFINE(timeout_changed_sem, 0, 1);
+static K_SEM_DEFINE(timeout_changed_sem, 0, 1);
 
-// Check if this entry affects the next timeout
+static inline uint32_t memlease_make_handle(uint32_t index, uint16_t allocate_num) {
+    return (index + 1) | ((uint32_t)allocate_num << 16); // Handles are 1-based, so 0 is never valid
+}
+
+// Check if this entry affects the next timeout. Must be called with memlease_lock held.
 static void memlease_check_timeout(memlease_entry_t *entry) {
     if (entry->expiry_time == 0) {
         // Infinite timeout
@@ -90,14 +97,17 @@ static void memlease_check_timeout(memlease_entry_t *entry) {
     }
 }
 
-// Initialize a memlease entry and return its handle
-static uint32_t memlease_init_entry(uint32_t index, memlease_entry_t *entry, uint32_t size, int64_t timeout, void **buf_out) {
-    uint32_t handle = 0;
-
-    if (index == 0xFFFE) {
-        // Maximum number of entries reached
-        return 0;
+static void memlease_set_expiry(memlease_entry_t *entry, int64_t timeout) {
+    if (timeout > 0) {
+        entry->expiry_time = k_uptime_get() + timeout;
+        memlease_check_timeout(entry);
+    } else {
+        entry->expiry_time = 0; // Infinite
     }
+}
+
+// Initialize a memlease entry and return its handle, 0 on failure
+static uint32_t memlease_init_entry(uint32_t index, memlease_entry_t *entry, uint32_t size, int64_t timeout, void **buf_out) {
     entry->buf = k_malloc(size);
     if (!entry->buf) {
         return 0;
@@ -107,103 +117,110 @@ static uint32_t memlease_init_entry(uint32_t index, memlease_entry_t *entry, uin
     }
     entry->size = size;
     entry->status = MEMLEASE_STATUS_ALLOCATED | MEMLEASE_STATUS_ERROR_ON_TIMEOUT;
-    if (timeout > 0) {
-        entry->expiry_time = k_uptime_get() + timeout;
-        memlease_check_timeout(entry);
-    } else {
-        entry->expiry_time = 0; // Infinite
-    }
     entry->release_count = 0;   // Default release count
-    entry->allocate_num = memlease_data.allocate_count++;
-    memlease_data.allocate_count &= 0xFFFF; // Wrap around
-    handle = index + 1; // Handles are 1-based
-    handle |= (entry->allocate_num << 16);
-    return handle;
+    entry->allocate_num = memlease_data.allocate_count++;   // Wraps around at 0xFFFF
+    memlease_set_expiry(entry, timeout);
+    return memlease_make_handle(index, entry->allocate_num);
 }
 
-// size - Size of the buffer in bytes
-// buf_out - If not NULL, the pointer to the allocated buffer is written to this pointer
-// timeout - Time in milliseconds the buffer is leased for, 0 means infinite
-// Returns a handle to the leased memory buffer, 0 on failure. This number cannot be used a pointer.
+// Free the buffer of an entry and mark it unused. Must be called with memlease_lock held.
+// Does not free the block, call memlease_trim_blocks() afterwards.
+static void memlease_free_entry(memlease_entry_block_t *block, memlease_entry_t *entry) {
+    k_free(entry->buf);
+    memset(entry, 0, sizeof(memlease_entry_t));
+    if (block->allocated_count) {
+        block->allocated_count--;
+    }
+    if (memlease_data.num_allocated) {
+        memlease_data.num_allocated--;
+    }
+}
+
+// Free empty dynamically allocated blocks at the end of the list. Must be called with memlease_lock held.
+// Only trailing blocks can be freed, because the entry index in a handle depends on the block position.
+static void memlease_trim_blocks(void) {
+    memlease_entry_block_t *block = memlease_data.last_block;
+
+    while ((block != &memlease_data.entries) && (block->allocated_count == 0)) {
+        memlease_entry_block_t *prev_block = block->prev;
+        prev_block->next = NULL;
+        k_free(block);
+        memlease_data.num_entries_allocated -= CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF;
+        block = prev_block;
+    }
+    memlease_data.last_block = block;
+}
+
 uint32_t memlease_alloc(uint32_t size, void **buf_out, int64_t timeout) {
     uint32_t handle = 0;
-    bool error = false;
+    uint32_t index = 0;
+    memlease_entry_block_t *block = &memlease_data.entries;
+    memlease_entry_t *entry = NULL;
 
+    if (buf_out) {
+        *buf_out = NULL;
+    }
     if (k_is_in_isr()) {
         LOG_ERR("memlease_alloc called from ISR");
         return 0;
     }
     k_mutex_lock(&memlease_lock, K_FOREVER);
-    do {
-        // Find a free entry
-        uint32_t i = 0;
-        uint32_t entry_num = 0;
-        memlease_entry_block_t *block = &memlease_data.entries;
-
-        while (i < memlease_data.num_entries_allocated) {
-            if (block->allocated_count >= CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF) {
-                // This block is full, skip to next block
-                i += CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF;
-                if (!block->next) {
+    // Find a free entry, skipping blocks that are full
+    while (block) {
+        if (block->allocated_count < CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF) {
+            for (uint32_t i = 0; i < CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF; i++) {
+                if (!(block->entries[i].status & MEMLEASE_STATUS_ALLOCATED)) {
+                    entry = &block->entries[i];
+                    index += i;
                     break;
                 }
-                block = (memlease_entry_block_t *)block->next;
-                entry_num = 0;
-                continue;
             }
-            memlease_entry_t *entry = &block->entries[i];
-            if (!(entry->status & MEMLEASE_STATUS_ALLOCATED)) {
-                // Found a free entry
-                handle = memlease_init_entry(i, entry, size, timeout, buf_out);
-                if (handle == 0) {
-                    // Memory allocation failed
-                    LOG_ERR("Failed to allocate buffer of size %d", size);
-                    error = true;
-                } else {
-                    block->allocated_count++;
-                }
+            if (entry) {
                 break;
             }
-            entry_num++;
-            if (entry_num >= CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF) {
-                if (!block->next) {
-                    LOG_ERR("Next block is NULL while number of allocated entries says there should be more");
-                    break;
-                }
-                block = (memlease_entry_block_t *)block->next;
-                entry_num = 0;
+            LOG_ERR("Block allocated count is %d but no free entry was found", block->allocated_count);
+        }
+        index += CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF;
+        block = block->next;
+    }
+    do {
+        if (!entry) {
+            // No free entry found, need to allocate a new block
+            if (index > MEMLEASE_MAX_ENTRY_INDEX) {
+                LOG_ERR("Maximum number of memlease entries reached");
+                break;
             }
-            i++;
-        }
-        if ((handle != 0) || error) {
-            // Successfully allocated or error occurred
+            block = k_calloc(1, sizeof(memlease_entry_block_t));
+            if (!block) {
+                LOG_ERR("Failed to allocate new memlease entry block");
+                break;
+            }
+            block->prev = memlease_data.last_block;
+            memlease_data.last_block->next = block;
+            memlease_data.last_block = block;
+            memlease_data.num_entries_allocated += CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF;
+            entry = &block->entries[0];
+        } else if (index > MEMLEASE_MAX_ENTRY_INDEX) {
+            LOG_ERR("Maximum number of memlease entries reached");
             break;
         }
-        // No free entry found, need to allocate a new block
-        memlease_entry_block_t *new_block = k_calloc(1, sizeof(memlease_entry_block_t));
-        if (!new_block) {
-            // Memory allocation failed
-            LOG_ERR("Failed to allocate new memlease entry block");
-            break;
-        }
-        block->next = new_block;
-        new_block->prev = block;
-        memlease_data.num_entries_allocated += CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF;
-        handle = memlease_init_entry(i, &new_block->entries[0], size, timeout, buf_out);
+        handle = memlease_init_entry(index, entry, size, timeout, buf_out);
         if (handle == 0) {
-            // Memory allocation failed
             LOG_ERR("Failed to allocate buffer of size %d", size);
-            k_free(new_block);
-            block->next = NULL;
-        } else {
-            new_block->allocated_count++;
+            break;
         }
+        block->allocated_count++;
+        memlease_data.num_allocated++;
     } while (0);
+    if (handle == 0) {
+        // Free the new block again if it ended up unused
+        memlease_trim_blocks();
+    }
     k_mutex_unlock(&memlease_lock);
     return handle;
 }
 
-// Check if the handle is valid
+// Check if the handle is valid. Must be called with memlease_lock held.
 // On success, out_entry and out_block are set to the corresponding entry and block
 static int32_t memlease_check_handle(uint32_t handle, memlease_entry_t **out_entry, memlease_entry_block_t **out_block) {
     uint16_t allocate_num = (handle >> 16) & 0xFFFF;
@@ -213,26 +230,26 @@ static int32_t memlease_check_handle(uint32_t handle, memlease_entry_t **out_ent
 
     // Check if entry index is within bounds
     if (entry_index >= memlease_data.num_entries_allocated) {
-        LOG_ERR("Handle entry index %d out of bounds (max %d)", entry_index, memlease_data.num_entries_allocated - 1);
-        return MEMLEASE_ERROR_ENTRY_OUT_OF_BOUNDS;      // Invalid handle
+        LOG_WRN("Handle 0x%08X entry index out of bounds (max %d)", handle, memlease_data.num_entries_allocated - 1);
+        return MEMLEASE_ERROR_ENTRY_OUT_OF_BOUNDS;
     }
     // Traverse to the correct block
-    while(entry_index >= CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF) {
+    while (entry_index >= CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF) {
         if (!block->next) {
             LOG_ERR("Next should point to a valid block");
             return MEMLEASE_ERROR_CORRUPT_BLOCK_POINTER;
         }
-        block = (memlease_entry_block_t *)block->next;
+        block = block->next;
         entry_index -= CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF;
     }
     entry = &block->entries[entry_index];
     if (!(entry->status & MEMLEASE_STATUS_ALLOCATED)) {
-        LOG_ERR("Handle points to unallocated entry");
+        LOG_WRN("Handle 0x%08X points to unallocated entry", handle);
         return MEMLEASE_ERROR_NOT_ALLOCATED;
     }
     if (entry->allocate_num != allocate_num) {
-        LOG_ERR("Handle allocation number mismatch (expected %d, got %d)", entry->allocate_num, allocate_num);
-        return MEMLEASE_ERROR_ALLOCATION_NUM_MISMATCH;  // Invalid handle
+        LOG_WRN("Handle 0x%08X allocation number mismatch (expected %d, got %d)", handle, entry->allocate_num, allocate_num);
+        return MEMLEASE_ERROR_ALLOCATION_NUM_MISMATCH;
     }
     // Valid handle
     *out_entry = entry;
@@ -240,42 +257,29 @@ static int32_t memlease_check_handle(uint32_t handle, memlease_entry_t **out_ent
     return 0;
 }
 
-// Return a pointer to the buffer, NULL if the handle is invalid
-// handle - Handle returned by memlease_alloc
-// out_size - If not NULL, the size of the buffer is written to this pointer
-// lock - If true, the buffer is marked as locked and will not be freed on timeout.
-//        If calling code is going to use this buffer and wants to prevent it from being freed while in use, 
-//        it should set this to true. Caller must make sure to free the buffer when finished. 
 void *memlease_get_buf(uint32_t handle, uint32_t *out_size, bool lock) {
     memlease_entry_t *entry = NULL;
     memlease_entry_block_t *block = NULL;
-    int32_t ret;
+    void *buf = NULL;
 
     if (k_is_in_isr()) {
         LOG_ERR("memlease_get_buf called from ISR");
         return NULL;
     }
     k_mutex_lock(&memlease_lock, K_FOREVER);
-    ret = memlease_check_handle(handle, &entry, &block);
-    if (ret != 0) {
-        k_mutex_unlock(&memlease_lock);
-        return NULL;
-    }
-    if (lock) {
-        entry->status |= MEMLEASE_STATUS_LOCKED;
-    } else if (entry->status & MEMLEASE_STATUS_LOCKED) {
-        entry->status &= ~MEMLEASE_STATUS_LOCKED;
-        memlease_check_timeout(entry);
-    }
-    if (out_size) {
-        *out_size = entry->size;
+    if (memlease_check_handle(handle, &entry, &block) == 0) {
+        if (lock) {
+            entry->status |= MEMLEASE_STATUS_LOCKED;
+        }
+        if (out_size) {
+            *out_size = entry->size;
+        }
+        buf = entry->buf;
     }
     k_mutex_unlock(&memlease_lock);
-    return entry->buf;
+    return buf;
 }
 
-// Free the leased memory buffer
-// handle - Handle returned by memlease_alloc
 int32_t memlease_free(uint32_t handle) {
     memlease_entry_t *entry = NULL;
     memlease_entry_block_t *block = NULL;
@@ -287,29 +291,22 @@ int32_t memlease_free(uint32_t handle) {
     }
     k_mutex_lock(&memlease_lock, K_FOREVER);
     ret = memlease_check_handle(handle, &entry, &block);
-    if (ret != 0) {
-        k_mutex_unlock(&memlease_lock);
-        return ret;
-    }
-    if (entry->release_count > 0) {
-        entry->release_count--;
-        entry->status &= ~MEMLEASE_STATUS_LOCKED;
-        memlease_check_timeout(entry);
-    } else {
-        // Free the entry
-        k_free(entry->buf);
-        memset(entry, 0, sizeof(memlease_entry_t));
-        if (block->allocated_count) {
-            block->allocated_count--;
+    if (ret == 0) {
+        if (entry->release_count > 0) {
+            entry->release_count--;
+            entry->status &= ~MEMLEASE_STATUS_LOCKED;
+            memlease_check_timeout(entry);
+        } else {
+            // No need to wake the timeout thread. If this entry held the next timeout,
+            // the thread wakes at that time, finds nothing to do and recalculates.
+            memlease_free_entry(block, entry);
+            memlease_trim_blocks();
         }
-        memlease_data.recalculate_timeout = true;
-        k_sem_give(&timeout_changed_sem);
     }
     k_mutex_unlock(&memlease_lock);
-    return 0;
+    return ret;
 }
 
-// Set or clear the lock status of the leased memory buffer
 int32_t memlease_set_lock(uint32_t handle, bool lock) {
     memlease_entry_t *entry = NULL;
     memlease_entry_block_t *block = NULL;
@@ -321,21 +318,18 @@ int32_t memlease_set_lock(uint32_t handle, bool lock) {
     }
     k_mutex_lock(&memlease_lock, K_FOREVER);
     ret = memlease_check_handle(handle, &entry, &block);
-    if (ret != 0) {
-        k_mutex_unlock(&memlease_lock);
-        return ret;
-    }
-    if (lock) {
-        entry->status |= MEMLEASE_STATUS_LOCKED;
-    } else {
-        entry->status &= ~MEMLEASE_STATUS_LOCKED;
-        memlease_check_timeout(entry);
+    if (ret == 0) {
+        if (lock) {
+            entry->status |= MEMLEASE_STATUS_LOCKED;
+        } else {
+            entry->status &= ~MEMLEASE_STATUS_LOCKED;
+            memlease_check_timeout(entry);
+        }
     }
     k_mutex_unlock(&memlease_lock);
-    return 0;
+    return ret;
 }
 
-// Set the timeout for the leased memory buffer
 int32_t memlease_set_timeout(uint32_t handle, int64_t timeout) {
     memlease_entry_t *entry = NULL;
     memlease_entry_block_t *block = NULL;
@@ -347,22 +341,14 @@ int32_t memlease_set_timeout(uint32_t handle, int64_t timeout) {
     }
     k_mutex_lock(&memlease_lock, K_FOREVER);
     ret = memlease_check_handle(handle, &entry, &block);
-    if (ret != 0) {
-        k_mutex_unlock(&memlease_lock);
-        return ret;
-    }
-    if (timeout > 0) {
-        entry->expiry_time = k_uptime_get() + timeout;
-        memlease_check_timeout(entry);
-    } else {
-        entry->expiry_time = 0; // Infinite
+    if (ret == 0) {
+        // If the timeout moved later, the thread wakes at the old time and recalculates
+        memlease_set_expiry(entry, timeout);
     }
     k_mutex_unlock(&memlease_lock);
-    return 0;
+    return ret;
 }
 
-// Set or clear the error on timeout flag for the leased memory buffer.
-// If set, an error message is logged when the buffer times out.
 int32_t memlease_set_error_on_timeout(uint32_t handle, bool error_on_timeout) {
     memlease_entry_t *entry = NULL;
     memlease_entry_block_t *block = NULL;
@@ -374,22 +360,17 @@ int32_t memlease_set_error_on_timeout(uint32_t handle, bool error_on_timeout) {
     }
     k_mutex_lock(&memlease_lock, K_FOREVER);
     ret = memlease_check_handle(handle, &entry, &block);
-    if (ret != 0) {
-        k_mutex_unlock(&memlease_lock);
-        return ret;
-    }
-    if (error_on_timeout) {
-        entry->status |= MEMLEASE_STATUS_ERROR_ON_TIMEOUT;
-    } else {
-        entry->status &= ~MEMLEASE_STATUS_ERROR_ON_TIMEOUT;
+    if (ret == 0) {
+        if (error_on_timeout) {
+            entry->status |= MEMLEASE_STATUS_ERROR_ON_TIMEOUT;
+        } else {
+            entry->status &= ~MEMLEASE_STATUS_ERROR_ON_TIMEOUT;
+        }
     }
     k_mutex_unlock(&memlease_lock);
-    return 0;
+    return ret;
 }
 
-// Set the release count for the leased memory buffer.
-// Need to be one less than the number of times the buffer needs to be released before it is freed.
-// For example, if the buffer needs to be released 3 times before it is freed, set release_count to 2.
 int32_t memlease_set_release_count(uint32_t handle, uint8_t release_count) {
     memlease_entry_t *entry = NULL;
     memlease_entry_block_t *block = NULL;
@@ -401,78 +382,76 @@ int32_t memlease_set_release_count(uint32_t handle, uint8_t release_count) {
     }
     k_mutex_lock(&memlease_lock, K_FOREVER);
     ret = memlease_check_handle(handle, &entry, &block);
-    if (ret != 0) {
-        k_mutex_unlock(&memlease_lock);
-        return ret;
+    if (ret == 0) {
+        entry->release_count = release_count;
     }
-    entry->release_count = release_count;
     k_mutex_unlock(&memlease_lock);
-    return 0;
+    return ret;
+}
+
+uint32_t memlease_get_num_allocated(void) {
+    uint32_t num;
+
+    k_mutex_lock(&memlease_lock, K_FOREVER);
+    num = memlease_data.num_allocated;
+    k_mutex_unlock(&memlease_lock);
+    return num;
+}
+
+// Free all expired entries and calculate the next timeout. Must be called with memlease_lock held.
+static void memlease_process_timeouts(int64_t now) {
+    uint32_t index = 0;
+
+    memlease_data.next_timeout = 0;
+    memlease_data.recalculate_timeout = false;
+    for (memlease_entry_block_t *block = &memlease_data.entries; block; block = block->next) {
+        for (uint32_t i = 0; i < CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF; i++, index++) {
+            memlease_entry_t *entry = &block->entries[i];
+
+            if (!(entry->status & MEMLEASE_STATUS_ALLOCATED) || (entry->expiry_time == 0) ||
+                (entry->status & MEMLEASE_STATUS_LOCKED)) {
+                // Unused, infinite or locked entries never time out
+                continue;
+            }
+            if (now >= entry->expiry_time) {
+                // This entry has timed out
+                if (entry->status & MEMLEASE_STATUS_ERROR_ON_TIMEOUT) {
+                    LOG_ERR("Memlease entry timed out (handle: 0x%08X)", memlease_make_handle(index, entry->allocate_num));
+                }
+                memlease_free_entry(block, entry);
+            } else if (!memlease_data.next_timeout || (entry->expiry_time < memlease_data.next_timeout)) {
+                memlease_data.next_timeout = entry->expiry_time;
+            }
+        }
+    }
+    memlease_trim_blocks();
 }
 
 // Memlease timeout management thread
-static void memlease_thread_fn(void) {
+static void memlease_thread_fn(void *p1, void *p2, void *p3) {
     k_timeout_t sleep_time = K_FOREVER;
     int64_t now;
 
-    while(true) {
+    ARG_UNUSED(p1);
+    ARG_UNUSED(p2);
+    ARG_UNUSED(p3);
+
+    while (true) {
         k_sem_take(&timeout_changed_sem, sleep_time);
-        now = k_uptime_get();
         k_mutex_lock(&memlease_lock, K_FOREVER);
-        if ((k_uptime_get() > memlease_data.next_timeout) || memlease_data.recalculate_timeout) {
+        now = k_uptime_get();
+        if (memlease_data.recalculate_timeout ||
+            (memlease_data.next_timeout && (now >= memlease_data.next_timeout))) {
             // At least one of the entries has timed out or we need to recalculate the next timeout
-            memlease_data.next_timeout = 0;
-            memlease_data.recalculate_timeout = false;
-            uint32_t i = 0;
-            memlease_entry_block_t *block = &memlease_data.entries;
-            bool not_last_entry = true;
-            while (not_last_entry) {
-                memlease_entry_t *entry = &block->entries[i];
-                if ((entry->status & MEMLEASE_STATUS_ALLOCATED) && (entry->expiry_time > 0)){
-                    // This entry has timed out
-                    if ((!(entry->status & MEMLEASE_STATUS_LOCKED)) && (now >= entry->expiry_time)) {
-                        // Free the entry
-                        if (entry->status & MEMLEASE_STATUS_ERROR_ON_TIMEOUT) {
-                            LOG_ERR("Memlease entry timed out (handle: 0x%08X)", (i + 1) | (entry->allocate_num << 16));
-                        }
-                        k_free(entry->buf);
-                        memset(entry, 0, sizeof(memlease_entry_t));
-                        if (block->allocated_count) {
-                            block->allocated_count--;
-                        }
-                    } else if (!memlease_data.next_timeout || (entry->expiry_time < memlease_data.next_timeout)) {
-                        memlease_data.next_timeout = entry->expiry_time;
-                    }
-                }
-                i++;
-                if (i >= CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF) {
-                    if (!block->allocated_count) {
-                        // Current block is empty, free it if it's not the first block
-                        if (block != &memlease_data.entries) {
-                            memlease_entry_block_t *prev_block = (memlease_entry_block_t *)block->prev;
-                            prev_block->next = block->next;
-                            if (block->next) {
-                                ((memlease_entry_block_t *)block->next)->prev = prev_block;
-                            }
-                            k_free(block);
-                            memlease_data.num_entries_allocated -= CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF;
-                            block = prev_block;
-                        }
-                    }
-                    if (block->next) {
-                        block = (memlease_entry_block_t *)block->next;
-                        i = 0;
-                    } else {
-                        not_last_entry = false;
-                    }
-                }
-            }
+            memlease_process_timeouts(now);
         }
         if (!memlease_data.next_timeout) {
             // No timeouts scheduled
             sleep_time = K_FOREVER;
-        } else {
+        } else if (memlease_data.next_timeout > now) {
             sleep_time = K_MSEC(memlease_data.next_timeout - now);
+        } else {
+            sleep_time = K_NO_WAIT;
         }
         k_mutex_unlock(&memlease_lock);
     }

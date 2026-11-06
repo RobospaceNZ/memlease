@@ -1,12 +1,20 @@
 menuconfig MEMLEASE
-    bool "Memlease"
+	bool "Memlease"
 	default y
+	help
+	  Lease-based heap memory management. Buffers are allocated from the
+	  system heap (k_malloc), so CONFIG_HEAP_MEM_POOL_SIZE must be > 0.
 
 if MEMLEASE
 
 config MEMLEASE_NUM_ENTRIES_PER_BUF
-    int "Number of entries per buffer"
-    default 32
+	int "Number of entries per buffer"
+	default 32
+	range 1 65535
+	help
+	  Number of allocation tracking entries stored in a single entry block.
+	  The first block is statically allocated, further blocks are allocated
+	  on the heap when needed.
 
 config MEMLEASE_THREAD_STACK_SIZE
 	int "Memlease thread stack size"
@@ -16,8 +24,8 @@ config MEMLEASE_THREAD_PRIORITY
 	int "Memlease thread priority"
 	default 7
 
-endif # MEMLEASE
-
 module = MEMLEASE
 module-str = Memlease
 source "subsys/logging/Kconfig.template.log_config"
+
+endif # MEMLEASE

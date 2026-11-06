@@ -47,3 +47,44 @@ Smaller values:
 - More frequent allocation and deallocation of entry blocks at runtime
 
 The default value of 32 provides a balanced trade-off for most systems. With this setting, up to 32 active heap allocations can be tracked before an additional entry block of 32 entries is allocated.
+
+## Usage
+
+Add the library to a Zephyr / nRF Connect SDK application (`add_subdirectory()` the repo from your app's `CMakeLists.txt` and `rsource "path/to/Kconfig.memlease"` from your app's `Kconfig`). Buffers come from the system heap, so `CONFIG_HEAP_MEM_POOL_SIZE` must be greater than 0.
+
+Buffers are referenced by a `uint32_t` handle instead of a pointer. The handle includes a per-allocation sequence number, so a stale handle (for example one whose buffer already timed out) is detected and rejected instead of touching memory that may have been reused.
+
+| Function | Description |
+|---|---|
+| `memlease_alloc(size, &buf, timeout_ms)` | Allocate a buffer. Returns a handle, or 0 on failure. `timeout_ms <= 0` means no timeout. |
+| `memlease_get_buf(handle, &size, lock)` | Get the buffer pointer, or NULL if the handle is no longer valid. `lock = true` protects the buffer from timing out while you use it. |
+| `memlease_free(handle)` | Release the buffer. It is freed once it has been released `release_count + 1` times. Each release also unlocks it. |
+| `memlease_set_release_count(handle, n)` | The buffer needs `n + 1` releases before it is freed (for example 2 for three consumers). |
+| `memlease_set_timeout(handle, timeout_ms)` | Renew or change the lease, counting from now. |
+| `memlease_set_lock(handle, lock)` | Lock or unlock. An expired buffer is reclaimed shortly after it is unlocked. |
+| `memlease_set_error_on_timeout(handle, en)` | Log an error when the buffer times out (enabled by default). |
+| `memlease_get_num_allocated()` | Number of buffers currently allocated. |
+
+Functions that take a handle return 0 on success or a negative `MEMLEASE_ERROR_*` code. None of the functions may be called from an ISR.
+
+```c
+// Send one buffer to three consumers, and reclaim it after 5 s if any of them never releases it
+void *buf;
+uint32_t handle = memlease_alloc(128, &buf, 5000);
+memlease_set_release_count(handle, 2);
+k_msgq_put(&consumer_a_q, &handle, K_NO_WAIT);
+k_msgq_put(&consumer_b_q, &handle, K_NO_WAIT);
+k_msgq_put(&consumer_c_q, &handle, K_NO_WAIT);
+
+// In each consumer
+uint32_t size;
+uint8_t *data = memlease_get_buf(handle, &size, true);   // lock while in use
+if (data) {
+    process(data, size);
+    memlease_free(handle);
+}
+```
+
+## Tests
+
+`tests/memlease_test` is a ztest suite. Run it on an nRF52840 DK with `tests/twister_ncs_3.1.0.bat <COM port>`.
