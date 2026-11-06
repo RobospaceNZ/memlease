@@ -1,6 +1,16 @@
+common:
+  platform_allow: nrf52840dk/nrf52840
+  tags: memlease
+  harness: ztest
+  timeout: 300
 tests:
-  memlease.test:
-    platform_allow: nrf52840dk/nrf52840
-    tags: memlease
-    harness: ztest
-    timeout: 300
+  memlease.test: {}
+  memlease.test.default_config:
+    extra_configs:
+      - CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF=32
+      - CONFIG_MEMLEASE_DEBUG_INFO=n
+  memlease.test.shell:
+    build_only: true
+    extra_configs:
+      - CONFIG_SHELL=y
+      - CONFIG_MEMLEASE_SHELL=y

@@ -23,6 +23,22 @@ config MEMLEASE_THREAD_STACK_SIZE
 config MEMLEASE_THREAD_PRIORITY
 	int "Memlease thread priority"
 	default 7
+	help
+	  Priority of the thread that frees expired leases and calls the
+	  expiry callbacks.
+
+config MEMLEASE_DEBUG_INFO
+	bool "Record allocation site and time"
+	help
+	  Store the file, line and uptime of every memlease_alloc() call, so
+	  memlease_foreach(), memlease_dump() and the shell command can show
+	  where each lease was allocated. Costs 16 bytes per entry.
+
+config MEMLEASE_SHELL
+	bool "Memlease shell commands"
+	depends on SHELL
+	help
+	  Adds the "memlease list" and "memlease stats" shell commands.
 
 module = MEMLEASE
 module-str = Memlease
