@@ -27,6 +27,60 @@ A common example is log buffering in BLE-based systems. After a device reset, it
 
 Using memlease, log buffers can be dynamically allocated with a timeout. If the logs are not retrieved within the specified time, the memory is automatically freed, preventing long-term memory waste while still allowing logs to be captured when needed.
 
+## Is it worth the overhead?
+
+A common objection to a library like this: heap bugs are hard to find, but once they are found and fixed, the firmware is stable and the library is just overhead. That is true if all you need is leak debugging. memlease's main value is different: it handles the cases where there is **no correct place to call free**:
+
+- **Unreliable consumers.** A log buffer that nobody ever requests is not a bug you can fix. It is how the system behaves, and a timeout is the right design.
+- **Multiple consumers.** Release counts remove the "whoever is last frees it" coupling between components. That stays useful after the bugs are gone.
+- **Failures in the field.** Rare paths such as a BLE disconnect mid-transfer, a full queue after an error, or a hung consumer thread are seldom covered by testing. A timeout turns a slow leak that bricks a device after three weeks into an error log and recovered memory.
+- **Stale handles.** A raw pointer used after free silently corrupts whatever reused that memory. A stale memlease handle is detected and rejected.
+
+### Cost
+
+Measured on an nRF52840 with the default configuration (32 entries per block, no debug info, no shell):
+
+| Cost | Amount |
+|---|---|
+| Flash | About 6 KB |
+| Static RAM | About 1.1 KB for the first entry block, plus about 1.1 KB for the thread stack |
+| Per buffer | 32 bytes for each buffer beyond the first 32 (which use the static block) |
+| CPU | A short search with interrupts briefly blocked on each allocation and handle lookup, and one pass over all leases each time a lease expires |
+
+The debugging features (`CONFIG_MEMLEASE_DEBUG_INFO`, `CONFIG_MEMLEASE_SHELL`) are off by default, so release builds only pay for what they use.
+
+### When to use memlease
+
+Use it at **asynchronous boundaries**: buffers that cross queues, events, ISR-to-thread handoffs, or go to consumers you don't control. That is where leaks come from, and where there is no clean place to free.
+
+### When not to use it
+
+- **Buffers allocated and freed in the same function, or owned by a single module.** Plain `k_malloc`/`k_free`, or a stack or static buffer, is simpler.
+- **Fixed-size, high-rate buffers** such as radio packets or sensor samples. Use `k_mem_slab` or `net_buf` pools: they are deterministic, they don't fragment, and allocation is constant-time.
+- **Hard real-time ISRs.** Allocation and handle lookup block interrupts for longer as the number of entry blocks grows.
+- **Very small parts** (for example 24 KB of RAM), where around 2 KB of fixed RAM is a real cost.
+
+## Fragmentation
+
+On devices with small heaps that run for a long time, fragmentation is often a bigger risk than leaks. A good rule is to use the heap only for buffers with a short lifetime and use global or static variables for anything long-lived. Lease timeouts help enforce that rule, but they don't solve fragmentation on their own.
+
+### How timeouts make it better
+
+Fragmentation is mostly caused by long-lived allocations sitting between short-lived ones. When the short-lived buffers around a long-lived one are freed, the gaps can't merge into one large free block, because the long-lived buffer sits between them. Zephyr's heap merges neighbouring free chunks on every free, so once everything in a region has been freed, that region is whole again.
+
+The worst offender is a leaked buffer: it is long-lived by accident and pins its spot forever. A timeout gives every buffer a maximum lifetime, so nothing can pin a spot forever. Fragmentation becomes temporary and **heals itself over time** instead of building up over weeks of uptime.
+
+### Where timeouts don't help
+
+- **Timeouts free memory; they never move it.** If the buffers that are live right now leave the heap fragmented, an allocation can still fail even though the total free space is enough. Timeouts only make that situation go away later, not at the moment the allocation is needed.
+- **Long timeouts are long lifetimes.** A 60 s lease is long-lived in heap terms. If other buffers come and go many times during those 60 s, the leased buffer pins its spot just like a global would, except at a random place in the heap. Timeouts help only when they are short compared with how often the heap is in use.
+- **Size variation matters more than lifetime.** Buffers of the same size hardly fragment, because any freed slot fits the next allocation. Mixed sizes are what break the heap up. For that, a `k_mem_slab` per size class does more than any timeout.
+- **`memlease_realloc()`** can move a buffer to a new spot in the heap, so use it sparingly.
+
+### memlease's own blocks
+
+Dynamic entry blocks (about 1 KB each with the default configuration) are allocated on the heap during peaks. Only the last block in the list can be freed, because handles encode the block's position. An empty block in the middle stays allocated until every block after it is empty, and it pins its spot in the heap until then. Set `CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF` high enough that a second block is never needed. `num_blocks` in `memlease_get_stats()` shows whether you got it right.
+
 ## Config
 
 CONFIG_MEMLEASE_NUM_ENTRIES_PER_BUF
